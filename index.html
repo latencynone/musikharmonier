@@ -14,7 +14,7 @@
 </head>
 <body>
 <div id="root"></div>
-<script type="text/babel" data-presets="react">
+<script id="app-source" type="text/plain">
 const { useState, useRef, useEffect, useMemo } = React;
 
 /* ---------- Music theory constants ---------- */
@@ -751,6 +751,16 @@ function PlaybackButton({ label, onClick, disabled, active, primary }) {
 
 const root = ReactDOM.createRoot(document.getElementById('root'));
 root.render(<App />);
+</script>
+<script>
+  // Transpile with the classic JSX runtime (React.createElement calls),
+  // not the automatic runtime, since the automatic runtime emits an
+  // `import` statement that a plain, non-module <script> cannot execute.
+  var __source = document.getElementById('app-source').textContent;
+  var __output = Babel.transform(__source, {
+    presets: [['react', { runtime: 'classic' }]],
+  }).code;
+  (0, eval)(__output);
 </script>
 </body>
 </html>
