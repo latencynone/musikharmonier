@@ -1,0 +1,756 @@
+<!DOCTYPE html>
+<html lang="sv">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>Stämma – hitta din stämma</title>
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<script src="https://cdn.tailwindcss.com"></script>
+<style>
+  html, body { margin: 0; padding: 0; background-color: #10131A; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel" data-presets="react">
+const { useState, useRef, useEffect, useMemo } = React;
+
+/* ---------- Music theory constants ---------- */
+
+const NOTE_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
+const MAJOR_INTERVALS = [0, 2, 4, 5, 7, 9, 11];
+const MINOR_INTERVALS = [0, 2, 3, 5, 7, 8, 10];
+
+// Krumhansl-Kessler key profiles, used to correlate a pitch-class
+// histogram against every possible tonic/mode to guess the key.
+const MAJOR_PROFILE = [6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88];
+const MINOR_PROFILE = [6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17];
+
+const HARMONY_TYPES = {
+  ters: {
+    label: 'Ters',
+    steps: 2,
+    defaultDirection: -1,
+    description: 'Den vanligaste stämman i kör- och popsång. Ligger tersavstånd från melodin och växlar naturligt mellan stor och liten ters beroende på var i tonarten melodin befinner sig.',
+  },
+  kvint: {
+    label: 'Kvint',
+    steps: 4,
+    defaultDirection: -1,
+    description: 'Ett öppet, stadigt avstånd som ofta hörs i folkmusik och femklanger. Ger stämman en stram, kraftfull karaktär.',
+  },
+  sext: {
+    label: 'Sext',
+    steps: 5,
+    defaultDirection: 1,
+    description: 'Ett varmt, fylligt avstånd — ett vanligt alternativ till tersen, särskilt i ballader.',
+  },
+};
+
+/* ---------- Pure helpers: pitch <-> MIDI <-> scale degree ---------- */
+
+function freqToMidi(freq) {
+  return 69 + 12 * Math.log2(freq / 440);
+}
+
+function midiToFreq(midi) {
+  return 440 * Math.pow(2, (midi - 69) / 12);
+}
+
+function getScaleIntervals(mode) {
+  return mode === 'major' ? MAJOR_INTERVALS : MINOR_INTERVALS;
+}
+
+// Semitone offset (from the tonic) of a given absolute diatonic "step".
+// Steps count scale degrees, e.g. step 2 is a diatonic third above the tonic,
+// step 7 is the tonic one octave up. This is monotonic in step.
+function semitoneForStep(step, intervals) {
+  const octave = Math.floor(step / 7);
+  const idx = ((step % 7) + 7) % 7;
+  return 12 * octave + intervals[idx];
+}
+
+function nearestScaleStep(semitoneOffset, intervals) {
+  const approx = Math.round((semitoneOffset * 7) / 12);
+  let best = approx;
+  let bestDiff = Infinity;
+  for (let s = approx - 2; s <= approx + 2; s++) {
+    const diff = Math.abs(semitoneForStep(s, intervals) - semitoneOffset);
+    if (diff < bestDiff) {
+      bestDiff = diff;
+      best = s;
+    }
+  }
+  return best;
+}
+
+function midiToScaleStep(midi, tonicPC, mode) {
+  const intervals = getScaleIntervals(mode);
+  const baseTonicMidi = 60 + tonicPC;
+  const semitoneOffset = Math.round(midi) - baseTonicMidi;
+  return nearestScaleStep(semitoneOffset, intervals);
+}
+
+function scaleStepToMidi(step, tonicPC, mode) {
+  const intervals = getScaleIntervals(mode);
+  const baseTonicMidi = 60 + tonicPC;
+  return baseTonicMidi + semitoneForStep(step, intervals);
+}
+
+/* ---------- Pitch detection (autocorrelation, vocal range) ---------- */
+
+function autoCorrelate(buf, sampleRate) {
+  const SIZE = buf.length;
+  let rms = 0;
+  for (let i = 0; i < SIZE; i++) rms += buf[i] * buf[i];
+  rms = Math.sqrt(rms / SIZE);
+  if (rms < 0.012) return { freq: -1, rms };
+
+  const minLag = Math.floor(sampleRate / 1000); // ~1000 Hz upper bound
+  const maxLag = Math.floor(sampleRate / 70); // ~70 Hz lower bound
+  let bestLag = -1;
+  let bestCorr = 0;
+  const c = new Float32Array(maxLag + 2);
+
+  for (let lag = minLag; lag <= maxLag; lag++) {
+    let sum = 0;
+    for (let i = 0; i < SIZE - lag; i++) sum += buf[i] * buf[i + lag];
+    c[lag] = sum;
+    if (sum > bestCorr) {
+      bestCorr = sum;
+      bestLag = lag;
+    }
+  }
+  if (bestLag < minLag) return { freq: -1, rms };
+
+  // Parabolic interpolation around the peak for sub-sample accuracy.
+  const c0 = c[bestLag - 1] || c[bestLag];
+  const c1 = c[bestLag];
+  const c2 = c[bestLag + 1] || c[bestLag];
+  const denom = c0 - 2 * c1 + c2;
+  const shift = denom !== 0 ? 0.5 * (c0 - c2) / denom : 0;
+  const refinedLag = bestLag + shift;
+
+  return { freq: sampleRate / refinedLag, rms };
+}
+
+/* ---------- Key detection ---------- */
+
+function correlate(hist, profile) {
+  const n = 12;
+  const meanH = hist.reduce((a, b) => a + b, 0) / n;
+  const meanP = profile.reduce((a, b) => a + b, 0) / n;
+  let num = 0, denH = 0, denP = 0;
+  for (let i = 0; i < n; i++) {
+    const dh = hist[i] - meanH;
+    const dp = profile[i] - meanP;
+    num += dh * dp;
+    denH += dh * dh;
+    denP += dp * dp;
+  }
+  if (denH === 0 || denP === 0) return 0;
+  return num / Math.sqrt(denH * denP);
+}
+
+function detectKey(hist) {
+  let best = { corr: -Infinity, tonic: 0, mode: 'major' };
+  for (let tonic = 0; tonic < 12; tonic++) {
+    const rotatedMajor = MAJOR_PROFILE.map((_, i) => MAJOR_PROFILE[(i - tonic + 12) % 12]);
+    const rotatedMinor = MINOR_PROFILE.map((_, i) => MINOR_PROFILE[(i - tonic + 12) % 12]);
+    const cMaj = correlate(hist, rotatedMajor);
+    const cMin = correlate(hist, rotatedMinor);
+    if (cMaj > best.corr) best = { corr: cMaj, tonic, mode: 'major' };
+    if (cMin > best.corr) best = { corr: cMin, tonic, mode: 'minor' };
+  }
+  return best;
+}
+
+/* ---------- Frames -> discrete notes ---------- */
+
+function framesToNotes(qFrames, minDur = 0.12) {
+  const notes = [];
+  let cur = null;
+  qFrames.forEach((f) => {
+    if (f.step === null) {
+      if (cur) { notes.push(cur); cur = null; }
+      return;
+    }
+    if (cur && cur.step === f.step) {
+      cur.end = f.t;
+    } else {
+      if (cur) notes.push(cur);
+      cur = { step: f.step, start: f.t, end: f.t };
+    }
+  });
+  if (cur) notes.push(cur);
+  return notes.filter((n) => n.end - n.start >= minDur);
+}
+
+/* ---------- Pitch-contour visualization (signature element) ---------- */
+
+function PitchCanvas({ melodyNotes, harmonyNotes, keyInfo, duration }) {
+  const canvasRef = useRef(null);
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const dpr = window.devicePixelRatio || 1;
+    const width = canvas.clientWidth || 320;
+    const height = canvas.clientHeight || 160;
+    canvas.width = width * dpr;
+    canvas.height = height * dpr;
+    const ctx = canvas.getContext('2d');
+    ctx.scale(dpr, dpr);
+    ctx.clearRect(0, 0, width, height);
+
+    ctx.strokeStyle = 'rgba(241,237,228,0.06)';
+    ctx.lineWidth = 1;
+    for (let i = 1; i < duration; i++) {
+      const x = (i / duration) * width;
+      ctx.beginPath();
+      ctx.moveTo(x, 0);
+      ctx.lineTo(x, height);
+      ctx.stroke();
+    }
+
+    if (!melodyNotes || melodyNotes.length === 0 || !keyInfo) {
+      ctx.fillStyle = 'rgba(241,237,228,0.32)';
+      ctx.font = '13px "Space Grotesk", sans-serif';
+      ctx.fillText('Din tonhöjdskurva ritas upp här efter inspelning', 14, height / 2);
+      return;
+    }
+
+    const melodyMidis = melodyNotes.map((n) => scaleStepToMidi(n.step, keyInfo.tonic, keyInfo.mode));
+    const harmonyMidis = harmonyNotes && harmonyNotes.length
+      ? harmonyNotes.map((n) => scaleStepToMidi(n.hStep, keyInfo.tonic, keyInfo.mode))
+      : [];
+    const all = melodyMidis.concat(harmonyMidis);
+    const minMidi = Math.min(...all) - 2;
+    const maxMidi = Math.max(...all) + 2;
+    const yFor = (midi) => height - ((midi - minMidi) / (maxMidi - minMidi)) * height;
+    const xFor = (t) => (t / duration) * width;
+
+    const drawLine = (notes, midis, color, glow) => {
+      ctx.lineCap = 'round';
+      notes.forEach((n, i) => {
+        const y = yFor(midis[i]);
+        ctx.beginPath();
+        ctx.moveTo(xFor(n.start), y);
+        ctx.lineTo(xFor(Math.max(n.end, n.start + 0.04)), y);
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 4;
+        ctx.shadowColor = glow;
+        ctx.shadowBlur = 8;
+        ctx.stroke();
+      });
+      ctx.shadowBlur = 0;
+    };
+
+    drawLine(melodyNotes, melodyMidis, '#FFB454', 'rgba(255,180,84,0.65)');
+    if (harmonyNotes && harmonyNotes.length) {
+      drawLine(harmonyNotes, harmonyMidis, '#55D6C0', 'rgba(85,214,192,0.65)');
+    }
+  }, [melodyNotes, harmonyNotes, keyInfo, duration]);
+
+  return <canvas ref={canvasRef} className="w-full h-40 md:h-48 block rounded-xl" />;
+}
+
+/* ---------- Main app ---------- */
+
+const DURATION = 10;
+
+function App() {
+  const [phase, setPhase] = useState('idle'); // idle | recording | analyzing | ready | error
+  const [errorMsg, setErrorMsg] = useState('');
+  const [countdown, setCountdown] = useState(DURATION);
+  const [keyInfo, setKeyInfo] = useState(null);
+  const [melodyNotes, setMelodyNotes] = useState([]);
+  const [recordedUrl, setRecordedUrl] = useState(null);
+  const [harmonyType, setHarmonyType] = useState(null);
+  const [direction, setDirection] = useState(-1);
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [nowPlaying, setNowPlaying] = useState(null);
+
+  const streamRef = useRef(null);
+  const audioCtxRef = useRef(null);
+  const mediaRecorderRef = useRef(null);
+  const chunksRef = useRef([]);
+  const framesRef = useRef([]);
+  const rafRef = useRef(null);
+  const audioElRef = useRef(null);
+  const playCtxRef = useRef(null);
+  const recordedUrlRef = useRef(null);
+  const playTimeoutRef = useRef(null);
+
+  useEffect(() => {
+    return () => {
+      if (rafRef.current) cancelAnimationFrame(rafRef.current);
+      if (playTimeoutRef.current) clearTimeout(playTimeoutRef.current);
+      if (streamRef.current) streamRef.current.getTracks().forEach((t) => t.stop());
+      if (audioCtxRef.current && audioCtxRef.current.state !== 'closed') audioCtxRef.current.close().catch(() => {});
+      if (playCtxRef.current && playCtxRef.current.state !== 'closed') playCtxRef.current.close().catch(() => {});
+      if (recordedUrlRef.current) URL.revokeObjectURL(recordedUrlRef.current);
+    };
+  }, []);
+
+  const harmonyNotes = useMemo(() => {
+    if (!harmonyType || !melodyNotes.length) return [];
+    const steps = HARMONY_TYPES[harmonyType].steps;
+    return melodyNotes.map((n) => ({ ...n, hStep: n.step + direction * steps }));
+  }, [harmonyType, direction, melodyNotes]);
+
+  const melodyPlaybackNotes = useMemo(() => {
+    if (!keyInfo) return [];
+    return melodyNotes.map((n) => ({ start: n.start, end: n.end, midi: scaleStepToMidi(n.step, keyInfo.tonic, keyInfo.mode) }));
+  }, [melodyNotes, keyInfo]);
+
+  const harmonyPlaybackNotes = useMemo(() => {
+    if (!keyInfo || !harmonyNotes.length) return [];
+    return harmonyNotes.map((n) => ({ start: n.start, end: n.end, midi: scaleStepToMidi(n.hStep, keyInfo.tonic, keyInfo.mode) }));
+  }, [harmonyNotes, keyInfo]);
+
+  function selectHarmony(type) {
+    setHarmonyType(type);
+    setDirection(HARMONY_TYPES[type].defaultDirection);
+  }
+
+  async function startRecording() {
+    setErrorMsg('');
+    setKeyInfo(null);
+    setMelodyNotes([]);
+    setHarmonyType(null);
+    stopPlayback();
+    if (recordedUrlRef.current) {
+      URL.revokeObjectURL(recordedUrlRef.current);
+      recordedUrlRef.current = null;
+      setRecordedUrl(null);
+    }
+
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      setPhase('error');
+      setErrorMsg('Den här webbläsaren stödjer inte mikrofoninspelning.');
+      return;
+    }
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      streamRef.current = stream;
+      const AC = window.AudioContext || window.webkitAudioContext;
+      const audioCtx = new AC();
+      audioCtxRef.current = audioCtx;
+      const source = audioCtx.createMediaStreamSource(stream);
+      const analyser = audioCtx.createAnalyser();
+      analyser.fftSize = 2048;
+      source.connect(analyser);
+
+      if (window.MediaRecorder) {
+        chunksRef.current = [];
+        try {
+          const mr = new MediaRecorder(stream);
+          mr.ondataavailable = (e) => { if (e.data.size > 0) chunksRef.current.push(e.data); };
+          mediaRecorderRef.current = mr;
+          mr.start();
+        } catch (e) {
+          mediaRecorderRef.current = null;
+        }
+      }
+
+      framesRef.current = [];
+      const startTime = audioCtx.currentTime;
+      let lastSampleTime = -1;
+      const buf = new Float32Array(analyser.fftSize);
+      setPhase('recording');
+      setCountdown(DURATION);
+
+      const tick = () => {
+        const now = audioCtx.currentTime - startTime;
+        if (now >= DURATION) {
+          finishRecording();
+          return;
+        }
+        setCountdown(Math.max(0, DURATION - now));
+        if (now - lastSampleTime >= 0.035) {
+          analyser.getFloatTimeDomainData(buf);
+          const { freq, rms } = autoCorrelate(buf, audioCtx.sampleRate);
+          framesRef.current.push({ t: now, freq: freq > 60 && freq < 1100 ? freq : -1, rms });
+          lastSampleTime = now;
+        }
+        rafRef.current = requestAnimationFrame(tick);
+      };
+      rafRef.current = requestAnimationFrame(tick);
+    } catch (err) {
+      setPhase('error');
+      setErrorMsg('Kunde inte komma åt mikrofonen. Kontrollera att appen har mikrofonbehörighet i webbläsaren.');
+    }
+  }
+
+  function finishRecording() {
+    if (rafRef.current) cancelAnimationFrame(rafRef.current);
+    setPhase('analyzing');
+    if (streamRef.current) streamRef.current.getTracks().forEach((t) => t.stop());
+
+    const mr = mediaRecorderRef.current;
+    if (mr && mr.state !== 'inactive') {
+      mr.onstop = () => {
+        const blob = new Blob(chunksRef.current, { type: (chunksRef.current[0] && chunksRef.current[0].type) || 'audio/webm' });
+        const url = URL.createObjectURL(blob);
+        recordedUrlRef.current = url;
+        setRecordedUrl(url);
+        runAnalysis();
+      };
+      mr.stop();
+    } else {
+      runAnalysis();
+    }
+  }
+
+  function runAnalysis() {
+    const frames = framesRef.current;
+    const voiced = frames.filter((f) => f.freq > 0);
+    if (voiced.length < 15) {
+      setPhase('error');
+      setErrorMsg('Vi kunde inte hitta en tydlig tonhöjd i inspelningen. Sjung en enkel, tydlig melodi lite starkare och testa igen.');
+      return;
+    }
+
+    const hist = new Array(12).fill(0);
+    voiced.forEach((f) => {
+      const midi = freqToMidi(f.freq);
+      const pc = ((Math.round(midi) % 12) + 12) % 12;
+      hist[pc] += 1;
+    });
+    const key = detectKey(hist);
+
+    const qFrames = frames.map((f) => {
+      if (f.freq <= 0) return { t: f.t, step: null };
+      return { t: f.t, step: midiToScaleStep(freqToMidi(f.freq), key.tonic, key.mode) };
+    });
+    const notes = framesToNotes(qFrames);
+
+    if (notes.length === 0) {
+      setPhase('error');
+      setErrorMsg('Vi kunde inte tolka en tydlig melodislinga. Testa att sjunga lite långsammare och tydligare.');
+      return;
+    }
+
+    setKeyInfo(key);
+    setMelodyNotes(notes);
+    setPhase('ready');
+  }
+
+  function resetAll() {
+    stopPlayback();
+    setPhase('idle');
+    setKeyInfo(null);
+    setMelodyNotes([]);
+    setHarmonyType(null);
+    setErrorMsg('');
+    if (recordedUrlRef.current) {
+      URL.revokeObjectURL(recordedUrlRef.current);
+      recordedUrlRef.current = null;
+      setRecordedUrl(null);
+    }
+  }
+
+  function stopPlayback() {
+    if (playTimeoutRef.current) {
+      clearTimeout(playTimeoutRef.current);
+      playTimeoutRef.current = null;
+    }
+    if (playCtxRef.current) {
+      playCtxRef.current.close().catch(() => {});
+      playCtxRef.current = null;
+    }
+    if (audioElRef.current) audioElRef.current.pause();
+    setIsPlaying(false);
+    setNowPlaying(null);
+  }
+
+  function makeVoice(ctx, now, notesArr, gainLevel) {
+    const osc = ctx.createOscillator();
+    osc.type = 'sine';
+    const gain = ctx.createGain();
+    gain.gain.value = 0;
+    osc.connect(gain).connect(ctx.destination);
+    osc.start(now);
+    notesArr.forEach((n) => {
+      const freq = midiToFreq(n.midi);
+      const start = now + n.start;
+      const end = Math.max(start + 0.05, now + n.end);
+      const attack = 0.02;
+      const release = Math.min(0.06, (end - start) / 3);
+      osc.frequency.setValueAtTime(freq, start);
+      gain.gain.setValueAtTime(0, start);
+      gain.gain.linearRampToValueAtTime(gainLevel, start + attack);
+      gain.gain.setValueAtTime(gainLevel, Math.max(start + attack, end - release));
+      gain.gain.linearRampToValueAtTime(0, end);
+    });
+    const lastEnd = notesArr.length ? notesArr[notesArr.length - 1].end : 0;
+    osc.stop(now + lastEnd + 0.3);
+    return osc;
+  }
+
+  function playSynth(which) {
+    stopPlayback();
+    const AC = window.AudioContext || window.webkitAudioContext;
+    const ctx = new AC();
+    playCtxRef.current = ctx;
+    const now = ctx.currentTime + 0.05;
+    setIsPlaying(true);
+    setNowPlaying(which);
+
+    if (which === 'melody') {
+      makeVoice(ctx, now, melodyPlaybackNotes, 0.22);
+    } else if (which === 'harmony') {
+      makeVoice(ctx, now, harmonyPlaybackNotes, 0.22);
+    } else if (which === 'both') {
+      makeVoice(ctx, now, melodyPlaybackNotes, 0.16);
+      makeVoice(ctx, now, harmonyPlaybackNotes, 0.16);
+    }
+
+    const totalDur = Math.max(
+      melodyPlaybackNotes.length ? melodyPlaybackNotes[melodyPlaybackNotes.length - 1].end : 0,
+      harmonyPlaybackNotes.length ? harmonyPlaybackNotes[harmonyPlaybackNotes.length - 1].end : 0
+    );
+    playTimeoutRef.current = setTimeout(() => {
+      setIsPlaying(false);
+      setNowPlaying(null);
+      playTimeoutRef.current = null;
+    }, (totalDur + 0.4) * 1000);
+  }
+
+  function playOriginal() {
+    stopPlayback();
+    if (audioElRef.current) {
+      audioElRef.current.currentTime = 0;
+      audioElRef.current.play();
+      setIsPlaying(true);
+      setNowPlaying('original');
+    }
+  }
+
+  const keyLabel = keyInfo ? `${NOTE_NAMES[keyInfo.tonic]}-${keyInfo.mode === 'major' ? 'dur' : 'moll'}` : null;
+
+  return (
+    <div className="min-h-screen w-full flex justify-center" style={{ backgroundColor: '#10131A', color: '#F1EDE4' }}>
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600;9..144,700&family=Space+Grotesk:wght@400;500;700&family=JetBrains+Mono:wght@400;500&display=swap');
+        .font-display { font-family: 'Fraunces', serif; }
+        .font-body { font-family: 'Space Grotesk', sans-serif; }
+        .font-mono-ui { font-family: 'JetBrains Mono', monospace; }
+        @keyframes pulseRec { 0%,100% { opacity: 1; transform: scale(1); } 50% { opacity: .35; transform: scale(0.82); } }
+        .rec-dot { animation: pulseRec 1.4s ease-in-out infinite; }
+        @media (prefers-reduced-motion: reduce) { .rec-dot { animation: none; } }
+        .stamma-btn:focus-visible { outline: 2px solid #FFB454; outline-offset: 2px; }
+      `}</style>
+
+      <div className="w-full max-w-md px-5 py-8 font-body">
+        {/* Header */}
+        <header className="mb-6">
+          <h1 className="font-display text-4xl font-semibold tracking-tight" style={{ color: '#F1EDE4' }}>
+            Stämma
+          </h1>
+          <p className="mt-2 text-sm leading-relaxed" style={{ color: '#8A8FA3' }}>
+            Sjung en melodi i tio sekunder. Appen känner av tonarten och bygger en stämma i ters, kvint eller sext som du kan träna in.
+          </p>
+        </header>
+
+        {/* Signature visualization */}
+        <div className="rounded-2xl p-3 mb-5" style={{ backgroundColor: '#171B26', border: '1px solid rgba(241,237,228,0.08)' }}>
+          <PitchCanvas melodyNotes={melodyNotes} harmonyNotes={harmonyNotes} keyInfo={keyInfo} duration={DURATION} />
+          {melodyNotes.length > 0 && (
+            <div className="flex items-center gap-4 mt-2 px-1 font-mono-ui text-xs" style={{ color: '#8A8FA3' }}>
+              <span className="flex items-center gap-1.5">
+                <span className="inline-block w-2.5 h-2.5 rounded-full" style={{ backgroundColor: '#FFB454' }} />
+                melodi
+              </span>
+              {harmonyType && (
+                <span className="flex items-center gap-1.5">
+                  <span className="inline-block w-2.5 h-2.5 rounded-full" style={{ backgroundColor: '#55D6C0' }} />
+                  stämma
+                </span>
+              )}
+            </div>
+          )}
+        </div>
+
+        {/* Error banner */}
+        {errorMsg && (
+          <div className="rounded-xl p-4 mb-5 text-sm" style={{ backgroundColor: 'rgba(255,107,107,0.1)', border: '1px solid rgba(255,107,107,0.3)', color: '#FFB4B4' }}>
+            {errorMsg}
+          </div>
+        )}
+
+        {/* Idle: start button */}
+        {(phase === 'idle' || phase === 'error') && (
+          <button
+            onClick={startRecording}
+            className="stamma-btn w-full rounded-2xl py-4 font-body font-medium text-base transition-transform active:scale-[0.98]"
+            style={{ backgroundColor: '#FFB454', color: '#10131A' }}
+          >
+            Spela in 10 sekunder
+          </button>
+        )}
+
+        {/* Recording */}
+        {phase === 'recording' && (
+          <div className="rounded-2xl p-5" style={{ backgroundColor: '#171B26', border: '1px solid rgba(255,107,107,0.3)' }}>
+            <div className="flex items-center gap-2 mb-3">
+              <span className="rec-dot inline-block w-2.5 h-2.5 rounded-full" style={{ backgroundColor: '#FF6B6B' }} />
+              <span className="font-mono-ui text-sm" style={{ color: '#FF6B6B' }}>SPELAR IN</span>
+              <span className="ml-auto font-mono-ui text-2xl" style={{ color: '#F1EDE4' }}>{Math.ceil(countdown)}s</span>
+            </div>
+            <div className="w-full h-1.5 rounded-full overflow-hidden" style={{ backgroundColor: 'rgba(241,237,228,0.1)' }}>
+              <div
+                className="h-full rounded-full"
+                style={{ width: `${((DURATION - countdown) / DURATION) * 100}%`, backgroundColor: '#FF6B6B', transition: 'width 80ms linear' }}
+              />
+            </div>
+            <p className="mt-3 text-sm" style={{ color: '#8A8FA3' }}>Sjung en enkel melodislinga, gärna med tydliga toner.</p>
+          </div>
+        )}
+
+        {/* Analyzing */}
+        {phase === 'analyzing' && (
+          <div className="rounded-2xl p-5 flex items-center gap-3" style={{ backgroundColor: '#171B26', border: '1px solid rgba(241,237,228,0.08)' }}>
+            <span
+              className="inline-block w-5 h-5 rounded-full animate-spin"
+              style={{ border: '2px solid rgba(241,237,228,0.15)', borderTopColor: '#FFB454' }}
+            />
+            <span className="text-sm" style={{ color: '#8A8FA3' }}>Analyserar tonart och melodi …</span>
+          </div>
+        )}
+
+        {/* Ready: key readout, harmony selection, playback */}
+        {phase === 'ready' && (
+          <div className="space-y-5">
+            <div className="rounded-2xl p-4 flex items-center justify-between" style={{ backgroundColor: '#171B26', border: '1px solid rgba(241,237,228,0.08)' }}>
+              <span className="text-sm" style={{ color: '#8A8FA3' }}>Uppfattad tonart</span>
+              <span className="font-mono-ui text-lg" style={{ color: '#FFB454' }}>{keyLabel}</span>
+            </div>
+
+            <div>
+              <h2 className="font-display text-lg font-semibold mb-2">Välj stämma</h2>
+              <div className="grid grid-cols-3 gap-2">
+                {Object.keys(HARMONY_TYPES).map((type) => {
+                  const active = harmonyType === type;
+                  return (
+                    <button
+                      key={type}
+                      onClick={() => selectHarmony(type)}
+                      className="stamma-btn rounded-xl py-3 font-body font-medium text-sm transition-colors"
+                      style={{
+                        backgroundColor: active ? '#55D6C0' : 'rgba(241,237,228,0.06)',
+                        color: active ? '#10131A' : '#F1EDE4',
+                        border: active ? '1px solid #55D6C0' : '1px solid rgba(241,237,228,0.12)',
+                      }}
+                    >
+                      {HARMONY_TYPES[type].label}
+                    </button>
+                  );
+                })}
+              </div>
+
+              {harmonyType && (
+                <>
+                  <p className="mt-3 text-xs leading-relaxed" style={{ color: '#8A8FA3' }}>
+                    {HARMONY_TYPES[harmonyType].description}
+                  </p>
+                  <div className="mt-3 flex gap-2">
+                    {[{ v: -1, label: 'Under melodin' }, { v: 1, label: 'Över melodin' }].map((opt) => (
+                      <button
+                        key={opt.v}
+                        onClick={() => setDirection(opt.v)}
+                        className="stamma-btn flex-1 rounded-lg py-2 text-xs font-medium"
+                        style={{
+                          backgroundColor: direction === opt.v ? 'rgba(85,214,192,0.15)' : 'transparent',
+                          color: direction === opt.v ? '#55D6C0' : '#8A8FA3',
+                          border: direction === opt.v ? '1px solid rgba(85,214,192,0.4)' : '1px solid rgba(241,237,228,0.12)',
+                        }}
+                      >
+                        {opt.label}
+                      </button>
+                    ))}
+                  </div>
+                </>
+              )}
+            </div>
+
+            <div>
+              <h2 className="font-display text-lg font-semibold mb-2">Lyssna</h2>
+              <div className="grid grid-cols-1 gap-2">
+                {recordedUrl && (
+                  <PlaybackButton
+                    label="Original (din inspelning)"
+                    active={isPlaying && nowPlaying === 'original'}
+                    onClick={playOriginal}
+                  />
+                )}
+                <PlaybackButton
+                  label="Melodislinga (ren ton)"
+                  active={isPlaying && nowPlaying === 'melody'}
+                  onClick={() => playSynth('melody')}
+                />
+                <PlaybackButton
+                  label="Stämma"
+                  primary
+                  disabled={!harmonyType}
+                  active={isPlaying && nowPlaying === 'harmony'}
+                  onClick={() => playSynth('harmony')}
+                />
+                <PlaybackButton
+                  label="Melodi + stämma tillsammans"
+                  disabled={!harmonyType}
+                  active={isPlaying && nowPlaying === 'both'}
+                  onClick={() => playSynth('both')}
+                />
+              </div>
+              {isPlaying && (
+                <button onClick={stopPlayback} className="stamma-btn mt-2 text-xs underline" style={{ color: '#8A8FA3' }}>
+                  Stoppa uppspelning
+                </button>
+              )}
+            </div>
+
+            <button
+              onClick={resetAll}
+              className="stamma-btn w-full rounded-xl py-3 text-sm font-medium"
+              style={{ backgroundColor: 'transparent', color: '#8A8FA3', border: '1px solid rgba(241,237,228,0.12)' }}
+            >
+              Spela in igen
+            </button>
+
+            {recordedUrl && <audio ref={audioElRef} src={recordedUrl} onEnded={() => { setIsPlaying(false); setNowPlaying(null); }} className="hidden" />}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function PlaybackButton({ label, onClick, disabled, active, primary }) {
+  return (
+    <button
+      onClick={onClick}
+      disabled={disabled}
+      className="stamma-btn w-full rounded-xl py-3 px-4 flex items-center justify-between text-sm font-medium transition-colors"
+      style={{
+        backgroundColor: disabled ? 'rgba(241,237,228,0.03)' : primary ? 'rgba(255,180,84,0.12)' : 'rgba(241,237,228,0.06)',
+        color: disabled ? 'rgba(241,237,228,0.25)' : primary ? '#FFB454' : '#F1EDE4',
+        border: active ? '1px solid #FFB454' : '1px solid rgba(241,237,228,0.1)',
+        cursor: disabled ? 'not-allowed' : 'pointer',
+      }}
+    >
+      <span>{label}</span>
+      <span className="font-mono-ui text-xs">{active ? '❚❚' : '▶'}</span>
+    </button>
+  );
+}
+
+const root = ReactDOM.createRoot(document.getElementById('root'));
+root.render(<App />);
+</script>
+</body>
+</html>
