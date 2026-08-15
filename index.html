@@ -336,6 +336,63 @@ function midiToNoteName(midi) {
   return `${NOTE_NAMES[pc]}${octave}`;
 }
 
+/* ---------- WAV export ---------- */
+
+// Encodes an AudioBuffer as a 16-bit PCM WAV Blob, ready to download.
+function audioBufferToWavBlob(buffer) {
+  const numChannels = buffer.numberOfChannels;
+  const sampleRate = buffer.sampleRate;
+  const numFrames = buffer.length;
+  const bytesPerSample = 2;
+  const blockAlign = numChannels * bytesPerSample;
+  const dataSize = numFrames * blockAlign;
+  const arrayBuf = new ArrayBuffer(44 + dataSize);
+  const view = new DataView(arrayBuf);
+
+  const writeString = (offset, str) => {
+    for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i));
+  };
+
+  writeString(0, 'RIFF');
+  view.setUint32(4, 36 + dataSize, true);
+  writeString(8, 'WAVE');
+  writeString(12, 'fmt ');
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true); // PCM
+  view.setUint16(22, numChannels, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * blockAlign, true);
+  view.setUint16(32, blockAlign, true);
+  view.setUint16(34, bytesPerSample * 8, true);
+  writeString(36, 'data');
+  view.setUint32(40, dataSize, true);
+
+  const channelData = [];
+  for (let ch = 0; ch < numChannels; ch++) channelData.push(buffer.getChannelData(ch));
+
+  let offset = 44;
+  for (let i = 0; i < numFrames; i++) {
+    for (let ch = 0; ch < numChannels; ch++) {
+      const s = Math.max(-1, Math.min(1, channelData[ch][i]));
+      view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+      offset += 2;
+    }
+  }
+
+  return new Blob([arrayBuf], { type: 'audio/wav' });
+}
+
+function downloadBlob(blob, filename) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 2000);
+}
+
 /* ---------- Pitch-contour visualization (signature element) ---------- */
 
 function PitchCanvas({ melodyNotes, harmonyNotes, keyInfo, duration, playheadTime }) {
@@ -478,6 +535,7 @@ function App() {
   const [voiceReady, setVoiceReady] = useState(false);
   const [recordingDuration, setRecordingDuration] = useState(DURATION);
   const [playheadTime, setPlayheadTime] = useState(null);
+  const [exporting, setExporting] = useState(null);
 
   const streamRef = useRef(null);
   const audioCtxRef = useRef(null);
@@ -753,6 +811,62 @@ function App() {
     src.connect(g).connect(ctx.destination);
     src.start(now);
     return src;
+  }
+
+  async function renderSynthOffline(notesArr, renderSoundType, sampleRate) {
+    const OfflineCtx = window.OfflineAudioContext || window.webkitOfflineAudioContext;
+    const totalDur = (notesArr.length ? notesArr[notesArr.length - 1].end : 0) + 0.4;
+    const offlineCtx = new OfflineCtx(1, Math.max(1, Math.ceil(totalDur * sampleRate)), sampleRate);
+    makeVoice(offlineCtx, 0.05, notesArr, 0.6, renderSoundType);
+    return offlineCtx.startRendering();
+  }
+
+  const exportSampleRate = () => (recordedBufferRef.current ? recordedBufferRef.current.sampleRate : 44100);
+
+  async function exportSong() {
+    if (!recordedBufferRef.current || exporting) return;
+    setExporting('song');
+    try {
+      const blob = audioBufferToWavBlob(recordedBufferRef.current);
+      downloadBlob(blob, 'stamma-sang.wav');
+    } finally {
+      setExporting(null);
+    }
+  }
+
+  async function exportMelody() {
+    if (!melodyPlaybackNotes.length || exporting) return;
+    setExporting('melody');
+    try {
+      if (soundType === 'recording' && recordedBufferRef.current) {
+        const blob = audioBufferToWavBlob(recordedBufferRef.current);
+        downloadBlob(blob, 'stamma-melodi.wav');
+      } else {
+        const buffer = await renderSynthOffline(melodyPlaybackNotes, soundType, exportSampleRate());
+        downloadBlob(audioBufferToWavBlob(buffer), 'stamma-melodi.wav');
+      }
+    } finally {
+      setExporting(null);
+    }
+  }
+
+  async function exportHarmony() {
+    if (!harmonyType || !harmonyPlaybackNotes.length || exporting) return;
+    setExporting('harmony');
+    try {
+      let buffer;
+      if (soundType === 'recording' && recordedBufferRef.current) {
+        const OfflineCtx = window.OfflineAudioContext || window.webkitOfflineAudioContext;
+        const bufferFactory = new OfflineCtx(1, 1, exportSampleRate());
+        buffer = buildPitchShiftedHarmonyBuffer(bufferFactory, recordedBufferRef.current, melodyNotes, harmonyNotes, keyInfo);
+      } else {
+        buffer = await renderSynthOffline(harmonyPlaybackNotes, soundType, exportSampleRate());
+      }
+      const suffix = `${harmonyType}-${direction === -1 ? 'under' : 'over'}`;
+      downloadBlob(audioBufferToWavBlob(buffer), `stamma-stamma-${suffix}.wav`);
+    } finally {
+      setExporting(null);
+    }
   }
 
   function playSynth(which) {
@@ -1056,6 +1170,33 @@ function App() {
               )}
             </div>
 
+            <div>
+              <h2 className="font-display text-lg font-semibold mb-2">Exportera</h2>
+              <p className="text-sm leading-relaxed mb-2" style={{ color: '#C7CBDA' }}>
+                Ladda ner sång och stämma som separata WAV-filer, t.ex. för att jobba vidare i Waveform.
+              </p>
+              <div className="grid grid-cols-1 gap-2">
+                <ExportButton
+                  label="Sång (original)"
+                  busy={exporting === 'song'}
+                  disabled={!recordedUrl || !!exporting}
+                  onClick={exportSong}
+                />
+                <ExportButton
+                  label={soundType === 'recording' ? 'Melodi (samma som originalet)' : 'Melodislinga (ren ton)'}
+                  busy={exporting === 'melody'}
+                  disabled={!melodyNotes.length || !!exporting}
+                  onClick={exportMelody}
+                />
+                <ExportButton
+                  label="Stämma"
+                  busy={exporting === 'harmony'}
+                  disabled={!harmonyType || !!exporting}
+                  onClick={exportHarmony}
+                />
+              </div>
+            </div>
+
             <button
               onClick={resetAll}
               className="stamma-btn w-full rounded-xl py-3 text-sm font-medium"
@@ -1069,6 +1210,25 @@ function App() {
         )}
       </div>
     </div>
+  );
+}
+
+function ExportButton({ label, onClick, disabled, busy }) {
+  return (
+    <button
+      onClick={onClick}
+      disabled={disabled}
+      className="stamma-btn w-full rounded-xl py-3 px-4 flex items-center justify-between text-sm font-medium transition-colors"
+      style={{
+        backgroundColor: disabled ? 'rgba(241,237,228,0.03)' : 'rgba(85,214,192,0.1)',
+        color: disabled ? 'rgba(241,237,228,0.25)' : '#55D6C0',
+        border: '1px solid rgba(241,237,228,0.1)',
+        cursor: disabled ? 'not-allowed' : 'pointer',
+      }}
+    >
+      <span>{label}</span>
+      <span className="font-mono-ui text-xs">{busy ? '…' : '⬇'}</span>
+    </button>
   );
 }
 
