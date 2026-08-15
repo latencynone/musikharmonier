@@ -306,6 +306,13 @@ function buildPitchShiftedHarmonyBuffer(ctx, recordedBuffer, melodyNotes, harmon
   return buffer;
 }
 
+function midiToNoteName(midi) {
+  const rounded = Math.round(midi);
+  const pc = ((rounded % 12) + 12) % 12;
+  const octave = Math.floor(rounded / 12) - 1;
+  return `${NOTE_NAMES[pc]}${octave}`;
+}
+
 /* ---------- Pitch-contour visualization (signature element) ---------- */
 
 function PitchCanvas({ melodyNotes, harmonyNotes, keyInfo, duration }) {
@@ -334,8 +341,8 @@ function PitchCanvas({ melodyNotes, harmonyNotes, keyInfo, duration }) {
     }
 
     if (!melodyNotes || melodyNotes.length === 0 || !keyInfo) {
-      ctx.fillStyle = 'rgba(241,237,228,0.32)';
-      ctx.font = '13px "Space Grotesk", sans-serif';
+      ctx.fillStyle = 'rgba(241,237,228,0.55)';
+      ctx.font = '14px "Space Grotesk", sans-serif';
       ctx.fillText('Din tonhöjdskurva ritas upp här efter inspelning', 14, height / 2);
       return;
     }
@@ -347,10 +354,13 @@ function PitchCanvas({ melodyNotes, harmonyNotes, keyInfo, duration }) {
     const all = melodyMidis.concat(harmonyMidis);
     const minMidi = Math.min(...all) - 2;
     const maxMidi = Math.max(...all) + 2;
-    const yFor = (midi) => height - ((midi - minMidi) / (maxMidi - minMidi)) * height;
+    const topPad = 20;
+    const bottomPad = 20;
+    const usableHeight = Math.max(1, height - topPad - bottomPad);
+    const yFor = (midi) => topPad + usableHeight - ((midi - minMidi) / (maxMidi - minMidi)) * usableHeight;
     const xFor = (t) => (t / duration) * width;
 
-    const drawLine = (notes, midis, color, glow) => {
+    const drawLine = (notes, midis, color, glow, labelDy) => {
       ctx.lineCap = 'round';
       notes.forEach((n, i) => {
         const y = yFor(midis[i]);
@@ -364,15 +374,30 @@ function PitchCanvas({ melodyNotes, harmonyNotes, keyInfo, duration }) {
         ctx.stroke();
       });
       ctx.shadowBlur = 0;
+
+      // Note-name labels, centered above (melody) or below (harmony) each segment.
+      ctx.font = '600 11px "JetBrains Mono", monospace';
+      ctx.textAlign = 'center';
+      ctx.fillStyle = color;
+      notes.forEach((n, i) => {
+        const segStart = xFor(n.start);
+        const segEnd = xFor(Math.max(n.end, n.start + 0.04));
+        const segWidth = segEnd - segStart;
+        if (segWidth < 14) return; // too narrow to label legibly
+        const label = midiToNoteName(midis[i]);
+        const cx = (segStart + segEnd) / 2;
+        const cy = yFor(midis[i]) + labelDy;
+        ctx.fillText(label, cx, cy);
+      });
     };
 
-    drawLine(melodyNotes, melodyMidis, '#FFB454', 'rgba(255,180,84,0.65)');
+    drawLine(melodyNotes, melodyMidis, '#FFB454', 'rgba(255,180,84,0.65)', -10);
     if (harmonyNotes && harmonyNotes.length) {
-      drawLine(harmonyNotes, harmonyMidis, '#55D6C0', 'rgba(85,214,192,0.65)');
+      drawLine(harmonyNotes, harmonyMidis, '#55D6C0', 'rgba(85,214,192,0.65)', 17);
     }
   }, [melodyNotes, harmonyNotes, keyInfo, duration]);
 
-  return <canvas ref={canvasRef} className="w-full h-40 md:h-48 block rounded-xl" />;
+  return <canvas ref={canvasRef} className="w-full h-48 md:h-56 block rounded-xl" />;
 }
 
 /* ---------- Main app ---------- */
@@ -392,6 +417,7 @@ function App() {
   const [nowPlaying, setNowPlaying] = useState(null);
   const [soundType, setSoundType] = useState('sine');
   const [voiceReady, setVoiceReady] = useState(false);
+  const [recordingDuration, setRecordingDuration] = useState(DURATION);
 
   const streamRef = useRef(null);
   const audioCtxRef = useRef(null);
@@ -404,6 +430,8 @@ function App() {
   const recordedUrlRef = useRef(null);
   const recordedBufferRef = useRef(null);
   const playTimeoutRef = useRef(null);
+  const recordingStartRef = useRef(0);
+  const finishedRef = useRef(false);
 
   useEffect(() => {
     return () => {
@@ -483,6 +511,8 @@ function App() {
 
       framesRef.current = [];
       const startTime = audioCtx.currentTime;
+      recordingStartRef.current = startTime;
+      finishedRef.current = false;
       let lastSampleTime = -1;
       const buf = new Float32Array(analyser.fftSize);
       setPhase('recording');
@@ -511,7 +541,14 @@ function App() {
   }
 
   function finishRecording() {
+    if (finishedRef.current) return;
+    finishedRef.current = true;
     if (rafRef.current) cancelAnimationFrame(rafRef.current);
+
+    const audioCtx = audioCtxRef.current;
+    const elapsed = audioCtx ? audioCtx.currentTime - recordingStartRef.current : DURATION;
+    setRecordingDuration(Math.max(0.3, Math.min(DURATION, elapsed)));
+
     setPhase('analyzing');
     if (streamRef.current) streamRef.current.getTracks().forEach((t) => t.stop());
 
@@ -542,6 +579,11 @@ function App() {
     } else {
       runAnalysis();
     }
+  }
+
+  function stopRecordingEarly() {
+    if (phase !== 'recording') return;
+    finishRecording();
   }
 
   function runAnalysis() {
@@ -587,6 +629,7 @@ function App() {
     setSoundType('sine');
     setVoiceReady(false);
     recordedBufferRef.current = null;
+    setRecordingDuration(DURATION);
     setErrorMsg('');
     if (recordedUrlRef.current) {
       URL.revokeObjectURL(recordedUrlRef.current);
@@ -720,16 +763,16 @@ function App() {
           <h1 className="font-display text-4xl font-semibold tracking-tight" style={{ color: '#F1EDE4' }}>
             Stämma
           </h1>
-          <p className="mt-2 text-sm leading-relaxed" style={{ color: '#8A8FA3' }}>
+          <p className="mt-2 text-base leading-relaxed" style={{ color: '#C7CBDA' }}>
             Sjung en melodi i tio sekunder. Appen känner av tonarten och bygger en stämma i ters, kvint eller sext som du kan träna in.
           </p>
         </header>
 
         {/* Signature visualization */}
         <div className="rounded-2xl p-3 mb-5" style={{ backgroundColor: '#171B26', border: '1px solid rgba(241,237,228,0.08)' }}>
-          <PitchCanvas melodyNotes={melodyNotes} harmonyNotes={harmonyNotes} keyInfo={keyInfo} duration={DURATION} />
+          <PitchCanvas melodyNotes={melodyNotes} harmonyNotes={harmonyNotes} keyInfo={keyInfo} duration={recordingDuration} />
           {melodyNotes.length > 0 && (
-            <div className="flex items-center gap-4 mt-2 px-1 font-mono-ui text-xs" style={{ color: '#8A8FA3' }}>
+            <div className="flex items-center gap-4 mt-2 px-1 font-mono-ui text-sm" style={{ color: '#C7CBDA' }}>
               <span className="flex items-center gap-1.5">
                 <span className="inline-block w-2.5 h-2.5 rounded-full" style={{ backgroundColor: '#FFB454' }} />
                 melodi
@@ -758,7 +801,7 @@ function App() {
             className="stamma-btn w-full rounded-2xl py-4 font-body font-medium text-base transition-transform active:scale-[0.98]"
             style={{ backgroundColor: '#FFB454', color: '#10131A' }}
           >
-            Spela in 10 sekunder
+            Spela in (max 10 sekunder)
           </button>
         )}
 
@@ -776,7 +819,14 @@ function App() {
                 style={{ width: `${((DURATION - countdown) / DURATION) * 100}%`, backgroundColor: '#FF6B6B', transition: 'width 80ms linear' }}
               />
             </div>
-            <p className="mt-3 text-sm" style={{ color: '#8A8FA3' }}>Sjung en enkel melodislinga, gärna med tydliga toner.</p>
+            <p className="mt-3 text-base" style={{ color: '#C7CBDA' }}>Sjung en enkel melodislinga, gärna med tydliga toner.</p>
+            <button
+              onClick={stopRecordingEarly}
+              className="stamma-btn w-full mt-4 rounded-xl py-3 font-body font-medium text-base transition-transform active:scale-[0.98]"
+              style={{ backgroundColor: 'rgba(255,107,107,0.15)', color: '#FF9B9B', border: '1px solid rgba(255,107,107,0.4)' }}
+            >
+              Stoppa inspelning nu
+            </button>
           </div>
         )}
 
@@ -787,7 +837,7 @@ function App() {
               className="inline-block w-5 h-5 rounded-full animate-spin"
               style={{ border: '2px solid rgba(241,237,228,0.15)', borderTopColor: '#FFB454' }}
             />
-            <span className="text-sm" style={{ color: '#8A8FA3' }}>Analyserar tonart och melodi …</span>
+            <span className="text-base" style={{ color: '#C7CBDA' }}>Analyserar tonart och melodi …</span>
           </div>
         )}
 
@@ -795,7 +845,7 @@ function App() {
         {phase === 'ready' && (
           <div className="space-y-5">
             <div className="rounded-2xl p-4 flex items-center justify-between" style={{ backgroundColor: '#171B26', border: '1px solid rgba(241,237,228,0.08)' }}>
-              <span className="text-sm" style={{ color: '#8A8FA3' }}>Uppfattad tonart</span>
+              <span className="text-base" style={{ color: '#C7CBDA' }}>Uppfattad tonart</span>
               <span className="font-mono-ui text-lg" style={{ color: '#FFB454' }}>{keyLabel}</span>
             </div>
 
@@ -823,7 +873,7 @@ function App() {
 
               {harmonyType && (
                 <>
-                  <p className="mt-3 text-xs leading-relaxed" style={{ color: '#8A8FA3' }}>
+                  <p className="mt-3 text-sm leading-relaxed" style={{ color: '#C7CBDA' }}>
                     {HARMONY_TYPES[harmonyType].description}
                   </p>
                   <div className="mt-3 flex gap-2">
@@ -834,7 +884,7 @@ function App() {
                         className="stamma-btn flex-1 rounded-lg py-2 text-xs font-medium"
                         style={{
                           backgroundColor: direction === opt.v ? 'rgba(85,214,192,0.15)' : 'transparent',
-                          color: direction === opt.v ? '#55D6C0' : '#8A8FA3',
+                          color: direction === opt.v ? '#55D6C0' : '#C7CBDA',
                           border: direction === opt.v ? '1px solid rgba(85,214,192,0.4)' : '1px solid rgba(241,237,228,0.12)',
                         }}
                       >
@@ -870,7 +920,7 @@ function App() {
                   );
                 })}
               </div>
-              <p className="mt-3 text-xs leading-relaxed" style={{ color: '#8A8FA3' }}>
+              <p className="mt-3 text-sm leading-relaxed" style={{ color: '#C7CBDA' }}>
                 {SOUND_TYPES[soundType].description}
               </p>
             </div>
@@ -905,7 +955,7 @@ function App() {
                 />
               </div>
               {isPlaying && (
-                <button onClick={stopPlayback} className="stamma-btn mt-2 text-xs underline" style={{ color: '#8A8FA3' }}>
+                <button onClick={stopPlayback} className="stamma-btn mt-2 text-xs underline" style={{ color: '#C7CBDA' }}>
                   Stoppa uppspelning
                 </button>
               )}
@@ -914,7 +964,7 @@ function App() {
             <button
               onClick={resetAll}
               className="stamma-btn w-full rounded-xl py-3 text-sm font-medium"
-              style={{ backgroundColor: 'transparent', color: '#8A8FA3', border: '1px solid rgba(241,237,228,0.12)' }}
+              style={{ backgroundColor: 'transparent', color: '#C7CBDA', border: '1px solid rgba(241,237,228,0.12)' }}
             >
               Spela in igen
             </button>
