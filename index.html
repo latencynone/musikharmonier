@@ -49,6 +49,12 @@ const HARMONY_TYPES = {
   },
 };
 
+const SOUND_TYPES = {
+  sine: { label: 'Ren synt', description: 'En ren sinuston. Enklast att stämma efter, minst "mänsklig".' },
+  voice: { label: 'Formantröst', description: 'En syntetisk vokalklang ("oo"), byggd med formantfilter — mer sångbar än en ren ton, men fortfarande syntetisk.' },
+  recording: { label: 'Din röst', description: 'Din egen inspelning, pitchskiftad till stämmans toner. Mest autentiskt, men kan låta lite kornigt vid större intervall som kvint och sext.' },
+};
+
 /* ---------- Pure helpers: pitch <-> MIDI <-> scale degree ---------- */
 
 function freqToMidi(freq) {
@@ -188,6 +194,118 @@ function framesToNotes(qFrames, minDur = 0.12) {
   return notes.filter((n) => n.end - n.start >= minDur);
 }
 
+/* ---------- Formant "voice" synthesis ---------- */
+
+// Builds a small vowel-ish resonance filter bank ("oo") fed by `source`
+// (a sawtooth oscillator). Formant center frequencies stay fixed while the
+// oscillator's fundamental changes per note — the same way real vowels work.
+function createFormantSum(ctx, source) {
+  const formants = [
+    { freq: 300, q: 9, gain: 1.0 },
+    { freq: 870, q: 11, gain: 0.5 },
+    { freq: 2240, q: 13, gain: 0.22 },
+  ];
+  const sum = ctx.createGain();
+  sum.gain.value = 0.8;
+  formants.forEach((f) => {
+    const filter = ctx.createBiquadFilter();
+    filter.type = 'bandpass';
+    filter.frequency.value = f.freq;
+    filter.Q.value = f.q;
+    const g = ctx.createGain();
+    g.gain.value = f.gain;
+    source.connect(filter);
+    filter.connect(g);
+    g.connect(sum);
+  });
+  return sum;
+}
+
+/* ---------- Granular pitch shifting of the real recording ---------- */
+
+// Simple linear-interpolation resample: shifts pitch by `ratio` and, as a
+// side effect, changes duration by 1/ratio.
+function resampleBuffer(samples, ratio) {
+  const outLen = Math.max(1, Math.round(samples.length / ratio));
+  const out = new Float32Array(outLen);
+  for (let i = 0; i < outLen; i++) {
+    const srcPos = i * ratio;
+    const i0 = Math.floor(srcPos);
+    const frac = srcPos - i0;
+    const s0 = samples[i0] || 0;
+    const s1 = samples[i0 + 1] || s0;
+    out[i] = s0 + (s1 - s0) * frac;
+  }
+  return out;
+}
+
+// Overlap-add granular time-stretch: restores the pitch-shifted segment to
+// `targetLen` samples without further altering its pitch content.
+function timeStretchOLA(samples, targetLen) {
+  const inLen = samples.length;
+  if (inLen === 0 || targetLen <= 0) return new Float32Array(Math.max(0, targetLen));
+  const grain = Math.min(2048, Math.max(256, Math.floor(inLen / 4) || 256));
+  const hopOut = Math.floor(grain / 2);
+  const speed = inLen / targetLen;
+  const hopIn = hopOut * speed;
+  const out = new Float32Array(targetLen);
+  const weight = new Float32Array(targetLen);
+  const win = new Float32Array(grain);
+  for (let i = 0; i < grain; i++) win[i] = 0.5 - 0.5 * Math.cos((2 * Math.PI * i) / Math.max(1, grain - 1));
+
+  let outPos = 0, inPos = 0;
+  while (outPos < targetLen) {
+    const base = Math.floor(inPos);
+    for (let i = 0; i < grain; i++) {
+      const srcIdx = base + i;
+      const dstIdx = outPos + i;
+      if (srcIdx >= 0 && srcIdx < inLen && dstIdx < targetLen) {
+        out[dstIdx] += samples[srcIdx] * win[i];
+        weight[dstIdx] += win[i];
+      }
+    }
+    outPos += hopOut;
+    inPos += hopIn;
+  }
+  for (let i = 0; i < targetLen; i++) out[i] = weight[i] > 0.0001 ? out[i] / weight[i] : 0;
+  return out;
+}
+
+// Pitch-shifts one audio segment by `ratio`, producing exactly `targetLen`
+// samples (so it lines up with the original note timing).
+function pitchShiftSegment(samples, ratio, targetLen) {
+  const shifted = resampleBuffer(samples, ratio);
+  return timeStretchOLA(shifted, targetLen);
+}
+
+// Builds a full-length harmony track by pitch-shifting the real recorded
+// audio underneath each melody note to that note's harmony pitch.
+function buildPitchShiftedHarmonyBuffer(ctx, recordedBuffer, melodyNotes, harmonyNotes, keyInfo) {
+  const sr = recordedBuffer.sampleRate;
+  const channelData = recordedBuffer.getChannelData(0);
+  const totalLen = channelData.length;
+  const out = new Float32Array(totalLen);
+
+  harmonyNotes.forEach((hn, i) => {
+    const mn = melodyNotes[i];
+    if (!mn) return;
+    const startSample = Math.max(0, Math.floor(mn.start * sr));
+    const endSample = Math.min(totalLen, Math.floor(mn.end * sr));
+    if (endSample <= startSample) return;
+    const segment = channelData.subarray(startSample, endSample);
+    const melodyFreq = midiToFreq(scaleStepToMidi(mn.step, keyInfo.tonic, keyInfo.mode));
+    const harmonyFreq = midiToFreq(scaleStepToMidi(hn.hStep, keyInfo.tonic, keyInfo.mode));
+    const ratio = harmonyFreq / melodyFreq;
+    const targetLen = endSample - startSample;
+    const shifted = pitchShiftSegment(segment, ratio, targetLen);
+    for (let k = 0; k < targetLen; k++) out[startSample + k] += shifted[k];
+  });
+
+  const buffer = ctx.createBuffer(1, totalLen, sr);
+  buffer.copyToChannel(out, 0);
+  return buffer;
+}
+
 /* ---------- Pitch-contour visualization (signature element) ---------- */
 
 function PitchCanvas({ melodyNotes, harmonyNotes, keyInfo, duration }) {
@@ -272,6 +390,8 @@ function App() {
   const [direction, setDirection] = useState(-1);
   const [isPlaying, setIsPlaying] = useState(false);
   const [nowPlaying, setNowPlaying] = useState(null);
+  const [soundType, setSoundType] = useState('sine');
+  const [voiceReady, setVoiceReady] = useState(false);
 
   const streamRef = useRef(null);
   const audioCtxRef = useRef(null);
@@ -282,6 +402,7 @@ function App() {
   const audioElRef = useRef(null);
   const playCtxRef = useRef(null);
   const recordedUrlRef = useRef(null);
+  const recordedBufferRef = useRef(null);
   const playTimeoutRef = useRef(null);
 
   useEffect(() => {
@@ -321,6 +442,9 @@ function App() {
     setKeyInfo(null);
     setMelodyNotes([]);
     setHarmonyType(null);
+    setSoundType('sine');
+    setVoiceReady(false);
+    recordedBufferRef.current = null;
     stopPlayback();
     if (recordedUrlRef.current) {
       URL.revokeObjectURL(recordedUrlRef.current);
@@ -393,11 +517,25 @@ function App() {
 
     const mr = mediaRecorderRef.current;
     if (mr && mr.state !== 'inactive') {
-      mr.onstop = () => {
+      mr.onstop = async () => {
         const blob = new Blob(chunksRef.current, { type: (chunksRef.current[0] && chunksRef.current[0].type) || 'audio/webm' });
         const url = URL.createObjectURL(blob);
         recordedUrlRef.current = url;
         setRecordedUrl(url);
+
+        try {
+          const arrayBuf = await blob.arrayBuffer();
+          const decodeCtx = audioCtxRef.current && audioCtxRef.current.state !== 'closed'
+            ? audioCtxRef.current
+            : new (window.AudioContext || window.webkitAudioContext)();
+          const audioBuffer = await decodeCtx.decodeAudioData(arrayBuf);
+          recordedBufferRef.current = audioBuffer;
+          setVoiceReady(true);
+        } catch (e) {
+          recordedBufferRef.current = null;
+          setVoiceReady(false);
+        }
+
         runAnalysis();
       };
       mr.stop();
@@ -446,6 +584,9 @@ function App() {
     setKeyInfo(null);
     setMelodyNotes([]);
     setHarmonyType(null);
+    setSoundType('sine');
+    setVoiceReady(false);
+    recordedBufferRef.current = null;
     setErrorMsg('');
     if (recordedUrlRef.current) {
       URL.revokeObjectURL(recordedUrlRef.current);
@@ -468,12 +609,13 @@ function App() {
     setNowPlaying(null);
   }
 
-  function makeVoice(ctx, now, notesArr, gainLevel) {
+  function makeVoice(ctx, now, notesArr, gainLevel, voiceSoundType) {
     const osc = ctx.createOscillator();
-    osc.type = 'sine';
+    osc.type = voiceSoundType === 'voice' ? 'sawtooth' : 'sine';
     const gain = ctx.createGain();
     gain.gain.value = 0;
-    osc.connect(gain).connect(ctx.destination);
+    const outNode = voiceSoundType === 'voice' ? createFormantSum(ctx, osc) : osc;
+    outNode.connect(gain).connect(ctx.destination);
     osc.start(now);
     notesArr.forEach((n) => {
       const freq = midiToFreq(n.midi);
@@ -492,6 +634,16 @@ function App() {
     return osc;
   }
 
+  function playBufferSource(ctx, now, buffer, gainLevel) {
+    const src = ctx.createBufferSource();
+    src.buffer = buffer;
+    const g = ctx.createGain();
+    g.gain.value = gainLevel;
+    src.connect(g).connect(ctx.destination);
+    src.start(now);
+    return src;
+  }
+
   function playSynth(which) {
     stopPlayback();
     const AC = window.AudioContext || window.webkitAudioContext;
@@ -501,19 +653,35 @@ function App() {
     setIsPlaying(true);
     setNowPlaying(which);
 
-    if (which === 'melody') {
-      makeVoice(ctx, now, melodyPlaybackNotes, 0.22);
-    } else if (which === 'harmony') {
-      makeVoice(ctx, now, harmonyPlaybackNotes, 0.22);
-    } else if (which === 'both') {
-      makeVoice(ctx, now, melodyPlaybackNotes, 0.16);
-      makeVoice(ctx, now, harmonyPlaybackNotes, 0.16);
-    }
-
-    const totalDur = Math.max(
+    let totalDur = Math.max(
       melodyPlaybackNotes.length ? melodyPlaybackNotes[melodyPlaybackNotes.length - 1].end : 0,
       harmonyPlaybackNotes.length ? harmonyPlaybackNotes[harmonyPlaybackNotes.length - 1].end : 0
     );
+
+    if (soundType === 'recording' && recordedBufferRef.current) {
+      const recBuf = recordedBufferRef.current;
+      totalDur = recBuf.duration;
+      if (which === 'melody') {
+        playBufferSource(ctx, now, recBuf, 0.9);
+      } else if (which === 'harmony') {
+        const hBuf = buildPitchShiftedHarmonyBuffer(ctx, recBuf, melodyNotes, harmonyNotes, keyInfo);
+        playBufferSource(ctx, now, hBuf, 0.9);
+      } else if (which === 'both') {
+        playBufferSource(ctx, now, recBuf, 0.7);
+        const hBuf = buildPitchShiftedHarmonyBuffer(ctx, recBuf, melodyNotes, harmonyNotes, keyInfo);
+        playBufferSource(ctx, now, hBuf, 0.7);
+      }
+    } else {
+      if (which === 'melody') {
+        makeVoice(ctx, now, melodyPlaybackNotes, 0.22, soundType);
+      } else if (which === 'harmony') {
+        makeVoice(ctx, now, harmonyPlaybackNotes, 0.22, soundType);
+      } else if (which === 'both') {
+        makeVoice(ctx, now, melodyPlaybackNotes, 0.16, soundType);
+        makeVoice(ctx, now, harmonyPlaybackNotes, 0.16, soundType);
+      }
+    }
+
     playTimeoutRef.current = setTimeout(() => {
       setIsPlaying(false);
       setNowPlaying(null);
@@ -679,6 +847,35 @@ function App() {
             </div>
 
             <div>
+              <h2 className="font-display text-lg font-semibold mb-2">Ljud</h2>
+              <div className="grid grid-cols-3 gap-2">
+                {Object.keys(SOUND_TYPES).map((type) => {
+                  const active = soundType === type;
+                  const disabled = type === 'recording' && !voiceReady;
+                  return (
+                    <button
+                      key={type}
+                      onClick={() => !disabled && setSoundType(type)}
+                      disabled={disabled}
+                      className="stamma-btn rounded-xl py-3 font-body font-medium text-sm transition-colors"
+                      style={{
+                        backgroundColor: disabled ? 'rgba(241,237,228,0.03)' : active ? '#FFB454' : 'rgba(241,237,228,0.06)',
+                        color: disabled ? 'rgba(241,237,228,0.25)' : active ? '#10131A' : '#F1EDE4',
+                        border: active ? '1px solid #FFB454' : '1px solid rgba(241,237,228,0.12)',
+                        cursor: disabled ? 'not-allowed' : 'pointer',
+                      }}
+                    >
+                      {SOUND_TYPES[type].label}
+                    </button>
+                  );
+                })}
+              </div>
+              <p className="mt-3 text-xs leading-relaxed" style={{ color: '#8A8FA3' }}>
+                {SOUND_TYPES[soundType].description}
+              </p>
+            </div>
+
+            <div>
               <h2 className="font-display text-lg font-semibold mb-2">Lyssna</h2>
               <div className="grid grid-cols-1 gap-2">
                 {recordedUrl && (
@@ -689,19 +886,19 @@ function App() {
                   />
                 )}
                 <PlaybackButton
-                  label="Melodislinga (ren ton)"
+                  label={soundType === 'recording' ? 'Din inspelade melodi' : 'Melodislinga (ren ton)'}
                   active={isPlaying && nowPlaying === 'melody'}
                   onClick={() => playSynth('melody')}
                 />
                 <PlaybackButton
-                  label="Stämma"
+                  label={soundType === 'recording' ? 'Stämma (din röst, pitchskiftad)' : 'Stämma'}
                   primary
                   disabled={!harmonyType}
                   active={isPlaying && nowPlaying === 'harmony'}
                   onClick={() => playSynth('harmony')}
                 />
                 <PlaybackButton
-                  label="Melodi + stämma tillsammans"
+                  label={soundType === 'recording' ? 'Melodi + stämma (din röst)' : 'Melodi + stämma tillsammans'}
                   disabled={!harmonyType}
                   active={isPlaying && nowPlaying === 'both'}
                   onClick={() => playSynth('both')}
