@@ -112,10 +112,10 @@ function autoCorrelate(buf, sampleRate) {
   let rms = 0;
   for (let i = 0; i < SIZE; i++) rms += buf[i] * buf[i];
   rms = Math.sqrt(rms / SIZE);
-  if (rms < 0.012) return { freq: -1, rms };
+  if (rms < 0.009) return { freq: -1, rms };
 
-  const minLag = Math.floor(sampleRate / 1000); // ~1000 Hz upper bound
-  const maxLag = Math.floor(sampleRate / 70); // ~70 Hz lower bound
+  const minLag = Math.floor(sampleRate / 1200); // ~1200 Hz upper bound
+  const maxLag = Math.floor(sampleRate / 55); // ~55 Hz lower bound
   let bestLag = -1;
   let bestCorr = 0;
   const c = new Float32Array(maxLag + 2);
@@ -175,7 +175,30 @@ function detectKey(hist) {
 
 /* ---------- Frames -> discrete notes ---------- */
 
-function framesToNotes(qFrames, minDur = 0.12) {
+// Bridges short unvoiced dropouts (e.g. a consonant clipping the mic) when
+// the pitch is the same right before and right after the gap, so a quick
+// syllable doesn't get split into fragments or dropped entirely.
+function fillShortGaps(qFrames, maxGapSec = 0.12) {
+  const out = qFrames.map((f) => ({ ...f }));
+  let i = 0;
+  while (i < out.length) {
+    if (out[i].step === null) {
+      let j = i;
+      while (j < out.length && out[j].step === null) j++;
+      const gapStart = i > 0 ? out[i - 1].t : null;
+      const gapEnd = j < out.length ? out[j].t : null;
+      if (gapStart !== null && gapEnd !== null && out[i - 1].step === out[j].step && gapEnd - gapStart <= maxGapSec) {
+        for (let k = i; k < j; k++) out[k].step = out[i - 1].step;
+      }
+      i = j;
+    } else {
+      i++;
+    }
+  }
+  return out;
+}
+
+function framesToNotes(qFrames, minDur = 0.07) {
   const notes = [];
   let cur = null;
   qFrames.forEach((f) => {
@@ -315,7 +338,7 @@ function midiToNoteName(midi) {
 
 /* ---------- Pitch-contour visualization (signature element) ---------- */
 
-function PitchCanvas({ melodyNotes, harmonyNotes, keyInfo, duration }) {
+function PitchCanvas({ melodyNotes, harmonyNotes, keyInfo, duration, playheadTime }) {
   const canvasRef = useRef(null);
 
   useEffect(() => {
@@ -375,19 +398,25 @@ function PitchCanvas({ melodyNotes, harmonyNotes, keyInfo, duration }) {
       });
       ctx.shadowBlur = 0;
 
-      // Note-name labels, centered above (melody) or below (harmony) each segment.
-      ctx.font = '600 11px "JetBrains Mono", monospace';
+      // Note-name labels, centered above (melody) or below (harmony) each
+      // segment. Skip a label only if it would actually overlap the
+      // previous one (measured, not a fixed width guess) so short notes
+      // still get labeled whenever there's room.
+      ctx.font = '600 9.5px "JetBrains Mono", monospace';
       ctx.textAlign = 'center';
       ctx.fillStyle = color;
+      let lastLabelRight = -Infinity;
       notes.forEach((n, i) => {
         const segStart = xFor(n.start);
         const segEnd = xFor(Math.max(n.end, n.start + 0.04));
-        const segWidth = segEnd - segStart;
-        if (segWidth < 14) return; // too narrow to label legibly
-        const label = midiToNoteName(midis[i]);
         const cx = (segStart + segEnd) / 2;
+        const label = midiToNoteName(midis[i]);
+        const labelWidth = ctx.measureText(label).width;
+        const labelLeft = cx - labelWidth / 2 - 2;
+        if (labelLeft < lastLabelRight) return; // would overlap the previous label
         const cy = yFor(midis[i]) + labelDy;
         ctx.fillText(label, cx, cy);
+        lastLabelRight = cx + labelWidth / 2 + 2;
       });
     };
 
@@ -395,7 +424,37 @@ function PitchCanvas({ melodyNotes, harmonyNotes, keyInfo, duration }) {
     if (harmonyNotes && harmonyNotes.length) {
       drawLine(harmonyNotes, harmonyMidis, '#55D6C0', 'rgba(85,214,192,0.65)', 17);
     }
-  }, [melodyNotes, harmonyNotes, keyInfo, duration]);
+
+    if (playheadTime !== null && playheadTime !== undefined) {
+      const x = xFor(Math.min(playheadTime, duration));
+      // Wide soft highlight band so the position reads at a glance, not
+      // just a thin line that can get lost among the note colors.
+      const bandGrad = ctx.createLinearGradient(x - 10, 0, x + 10, 0);
+      bandGrad.addColorStop(0, 'rgba(241,237,228,0)');
+      bandGrad.addColorStop(0.5, 'rgba(241,237,228,0.16)');
+      bandGrad.addColorStop(1, 'rgba(241,237,228,0)');
+      ctx.fillStyle = bandGrad;
+      ctx.fillRect(x - 10, 0, 20, height);
+
+      ctx.strokeStyle = '#FFFFFF';
+      ctx.lineWidth = 2.5;
+      ctx.shadowColor = 'rgba(255,255,255,0.85)';
+      ctx.shadowBlur = 10;
+      ctx.beginPath();
+      ctx.moveTo(x, 0);
+      ctx.lineTo(x, height);
+      ctx.stroke();
+      ctx.shadowBlur = 0;
+
+      ctx.beginPath();
+      ctx.moveTo(x - 5, 0);
+      ctx.lineTo(x + 5, 0);
+      ctx.lineTo(x, 8);
+      ctx.closePath();
+      ctx.fillStyle = '#FFFFFF';
+      ctx.fill();
+    }
+  }, [melodyNotes, harmonyNotes, keyInfo, duration, playheadTime]);
 
   return <canvas ref={canvasRef} className="w-full h-48 md:h-56 block rounded-xl" />;
 }
@@ -418,6 +477,7 @@ function App() {
   const [soundType, setSoundType] = useState('sine');
   const [voiceReady, setVoiceReady] = useState(false);
   const [recordingDuration, setRecordingDuration] = useState(DURATION);
+  const [playheadTime, setPlayheadTime] = useState(null);
 
   const streamRef = useRef(null);
   const audioCtxRef = useRef(null);
@@ -431,11 +491,13 @@ function App() {
   const recordedBufferRef = useRef(null);
   const playTimeoutRef = useRef(null);
   const recordingStartRef = useRef(0);
+  const playheadRafRef = useRef(null);
   const finishedRef = useRef(false);
 
   useEffect(() => {
     return () => {
       if (rafRef.current) cancelAnimationFrame(rafRef.current);
+      if (playheadRafRef.current) cancelAnimationFrame(playheadRafRef.current);
       if (playTimeoutRef.current) clearTimeout(playTimeoutRef.current);
       if (streamRef.current) streamRef.current.getTracks().forEach((t) => t.stop());
       if (audioCtxRef.current && audioCtxRef.current.state !== 'closed') audioCtxRef.current.close().catch(() => {});
@@ -528,7 +590,7 @@ function App() {
         if (now - lastSampleTime >= 0.035) {
           analyser.getFloatTimeDomainData(buf);
           const { freq, rms } = autoCorrelate(buf, audioCtx.sampleRate);
-          framesRef.current.push({ t: now, freq: freq > 60 && freq < 1100 ? freq : -1, rms });
+          framesRef.current.push({ t: now, freq: freq > 55 && freq < 1200 ? freq : -1, rms });
           lastSampleTime = now;
         }
         rafRef.current = requestAnimationFrame(tick);
@@ -607,7 +669,8 @@ function App() {
       if (f.freq <= 0) return { t: f.t, step: null };
       return { t: f.t, step: midiToScaleStep(freqToMidi(f.freq), key.tonic, key.mode) };
     });
-    const notes = framesToNotes(qFrames);
+    const bridged = fillShortGaps(qFrames);
+    const notes = framesToNotes(bridged);
 
     if (notes.length === 0) {
       setPhase('error');
@@ -643,6 +706,10 @@ function App() {
       clearTimeout(playTimeoutRef.current);
       playTimeoutRef.current = null;
     }
+    if (playheadRafRef.current) {
+      cancelAnimationFrame(playheadRafRef.current);
+      playheadRafRef.current = null;
+    }
     if (playCtxRef.current) {
       playCtxRef.current.close().catch(() => {});
       playCtxRef.current = null;
@@ -650,6 +717,7 @@ function App() {
     if (audioElRef.current) audioElRef.current.pause();
     setIsPlaying(false);
     setNowPlaying(null);
+    setPlayheadTime(null);
   }
 
   function makeVoice(ctx, now, notesArr, gainLevel, voiceSoundType) {
@@ -728,8 +796,18 @@ function App() {
     playTimeoutRef.current = setTimeout(() => {
       setIsPlaying(false);
       setNowPlaying(null);
+      setPlayheadTime(null);
       playTimeoutRef.current = null;
     }, (totalDur + 0.4) * 1000);
+
+    const tickPlayhead = () => {
+      const elapsed = ctx.currentTime - now;
+      setPlayheadTime(Math.max(0, elapsed));
+      if (elapsed < totalDur + 0.1) {
+        playheadRafRef.current = requestAnimationFrame(tickPlayhead);
+      }
+    };
+    playheadRafRef.current = requestAnimationFrame(tickPlayhead);
   }
 
   function playOriginal() {
@@ -739,6 +817,18 @@ function App() {
       audioElRef.current.play();
       setIsPlaying(true);
       setNowPlaying('original');
+
+      const tickPlayhead = () => {
+        const el = audioElRef.current;
+        if (!el) return;
+        setPlayheadTime(el.currentTime);
+        if (!el.paused && !el.ended) {
+          playheadRafRef.current = requestAnimationFrame(tickPlayhead);
+        } else {
+          setPlayheadTime(null);
+        }
+      };
+      playheadRafRef.current = requestAnimationFrame(tickPlayhead);
     }
   }
 
@@ -770,7 +860,7 @@ function App() {
 
         {/* Signature visualization */}
         <div className="rounded-2xl p-3 mb-5" style={{ backgroundColor: '#171B26', border: '1px solid rgba(241,237,228,0.08)' }}>
-          <PitchCanvas melodyNotes={melodyNotes} harmonyNotes={harmonyNotes} keyInfo={keyInfo} duration={recordingDuration} />
+          <PitchCanvas melodyNotes={melodyNotes} harmonyNotes={harmonyNotes} keyInfo={keyInfo} duration={recordingDuration} playheadTime={playheadTime} />
           {melodyNotes.length > 0 && (
             <div className="flex items-center gap-4 mt-2 px-1 font-mono-ui text-sm" style={{ color: '#C7CBDA' }}>
               <span className="flex items-center gap-1.5">
@@ -781,6 +871,11 @@ function App() {
                 <span className="flex items-center gap-1.5">
                   <span className="inline-block w-2.5 h-2.5 rounded-full" style={{ backgroundColor: '#55D6C0' }} />
                   stämma
+                </span>
+              )}
+              {playheadTime !== null && (
+                <span className="ml-auto" style={{ color: '#F1EDE4' }}>
+                  {playheadTime.toFixed(1)}s / {recordingDuration.toFixed(1)}s
                 </span>
               )}
             </div>
@@ -969,7 +1064,7 @@ function App() {
               Spela in igen
             </button>
 
-            {recordedUrl && <audio ref={audioElRef} src={recordedUrl} onEnded={() => { setIsPlaying(false); setNowPlaying(null); }} className="hidden" />}
+            {recordedUrl && <audio ref={audioElRef} src={recordedUrl} onEnded={() => { setIsPlaying(false); setNowPlaying(null); setPlayheadTime(null); }} className="hidden" />}
           </div>
         )}
       </div>
