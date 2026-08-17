@@ -217,6 +217,25 @@ function framesToNotes(qFrames, minDur = 0.07) {
   return notes.filter((n) => n.end - n.start >= minDur);
 }
 
+// Drops brief notes that sit right next to a stable note but are an
+// implausible interval away from it (10+ semitones). These are almost
+// always pitch-tracking artifacts from the attack transient of a syllable
+// (the tracker briefly locks onto a harmonic before settling), not a note
+// the person actually sang — and pitch-shifting them produces an audible
+// "chirp".
+function filterTransientArtifacts(notes, tonicPC, mode, maxArtifactDur = 0.15, minJumpSemitones = 10, maxNeighborGap = 0.12) {
+  const midiFor = (n) => scaleStepToMidi(n.step, tonicPC, mode);
+  return notes.filter((n, i) => {
+    if (n.end - n.start > maxArtifactDur) return true;
+    const midi = midiFor(n);
+    const prev = notes[i - 1];
+    const next = notes[i + 1];
+    if (prev && n.start - prev.end <= maxNeighborGap && Math.abs(midi - midiFor(prev)) >= minJumpSemitones) return false;
+    if (next && next.start - n.end <= maxNeighborGap && Math.abs(midi - midiFor(next)) >= minJumpSemitones) return false;
+    return true;
+  });
+}
+
 /* ---------- Formant "voice" synthesis ---------- */
 
 // Builds a small vowel-ish resonance filter bank ("oo") fed by `source`
@@ -271,8 +290,12 @@ function resampleNoteFromCenter(channelData, centerSample, targetLen, ratio) {
 // Builds a full-length harmony track. Starts as an exact copy of the real
 // recording (so consonants, breaths, and pauses are always there,
 // byte-identical to the original), then replaces the audio under each
-// melody note with a pitch-shifted version, crossfading at the note edges
-// so it blends cleanly with the untouched audio around it.
+// melody note — plus a little of the quiet/consonant material right next to
+// it — with a pitch-shifted version. Extending slightly past the note's own
+// boundaries keeps attached consonants (like a trailing "s") shifted with
+// the vowel instead of snapping back to the unshifted original mid-word.
+// The extension is capped at half the gap to the neighboring note, so real
+// pauses between phrases are left untouched.
 function buildPitchShiftedHarmonyBuffer(ctx, recordedBuffer, melodyNotes, harmonyNotes, keyInfo) {
   const sr = recordedBuffer.sampleRate;
   const channelData = recordedBuffer.getChannelData(0);
@@ -281,12 +304,19 @@ function buildPitchShiftedHarmonyBuffer(ctx, recordedBuffer, melodyNotes, harmon
   out.set(channelData);
 
   const crossfadeSamples = Math.round(0.012 * sr); // ~12ms
+  const maxPad = 0.15; // seconds
 
   harmonyNotes.forEach((hn, i) => {
     const mn = melodyNotes[i];
     if (!mn) return;
-    const startSample = Math.max(0, Math.floor(mn.start * sr));
-    const endSample = Math.min(totalLen, Math.floor(mn.end * sr));
+
+    const prevEnd = i > 0 ? melodyNotes[i - 1].end : -Infinity;
+    const nextStart = i < melodyNotes.length - 1 ? melodyNotes[i + 1].start : Infinity;
+    const padBack = Math.max(0, Math.min(maxPad, (mn.start - prevEnd) / 2));
+    const padFwd = Math.max(0, Math.min(maxPad, (nextStart - mn.end) / 2));
+
+    const startSample = Math.max(0, Math.floor((mn.start - padBack) * sr));
+    const endSample = Math.min(totalLen, Math.floor((mn.end + padFwd) * sr));
     const targetLen = endSample - startSample;
     if (targetLen <= 0) return;
 
@@ -709,7 +739,8 @@ function App() {
       return { t: f.t, step: midiToScaleStep(freqToMidi(f.freq), key.tonic, key.mode) };
     });
     const bridged = fillShortGaps(qFrames);
-    const notes = framesToNotes(bridged);
+    const rawNotes = framesToNotes(bridged);
+    const notes = filterTransientArtifacts(rawNotes, key.tonic, key.mode);
 
     if (notes.length === 0) {
       setPhase('error');
