@@ -326,12 +326,33 @@ function buildPitchShiftedHarmonyBuffer(ctx, recordedBuffer, melodyNotes, harmon
     const centerSample = (startSample + endSample) / 2;
     const shifted = resampleNoteFromCenter(channelData, centerSample, targetLen, ratio);
 
+    // Large ratios need more source material than a short note itself
+    // contains, so they can end up partly built from quieter neighboring
+    // audio (silence, a soft consonant) — diluting the note's loudness and
+    // making it sound weak or like it drops out. Correct for that by
+    // matching the shifted note's loudness back to what the singer
+    // actually sang for its own (unpadded) duration.
+    const rmsOf = (arr, from, to) => {
+      if (to <= from) return 0;
+      let s = 0;
+      for (let i = from; i < to; i++) s += arr[i] * arr[i];
+      return Math.sqrt(s / (to - from));
+    };
+    const origCoreRms = rmsOf(channelData, Math.floor(mn.start * sr), Math.floor(mn.end * sr));
+    const coreLocalStart = Math.max(0, Math.floor(mn.start * sr) - startSample);
+    const coreLocalEnd = Math.min(targetLen, Math.floor(mn.end * sr) - startSample);
+    const shiftedCoreRms = rmsOf(shifted, coreLocalStart, coreLocalEnd);
+    let gain = 1;
+    if (shiftedCoreRms > 0.0005 && origCoreRms > 0.0005) {
+      gain = Math.max(0.5, Math.min(2.5, origCoreRms / shiftedCoreRms));
+    }
+
     for (let k = 0; k < targetLen; k++) {
       let w = 1;
       if (k < crossfadeSamples) w = k / crossfadeSamples;
       else if (k > targetLen - crossfadeSamples) w = (targetLen - k) / crossfadeSamples;
       const idx = startSample + k;
-      out[idx] = out[idx] * (1 - w) + shifted[k] * w;
+      out[idx] = out[idx] * (1 - w) + shifted[k] * gain * w;
     }
   });
 
