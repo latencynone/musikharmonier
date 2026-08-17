@@ -244,84 +244,65 @@ function createFormantSum(ctx, source) {
   return sum;
 }
 
-/* ---------- Granular pitch shifting of the real recording ---------- */
+/* ---------- Pitch shifting of the real recording ---------- */
 
-// Simple linear-interpolation resample: shifts pitch by `ratio` and, as a
-// side effect, changes duration by 1/ratio.
-function resampleBuffer(samples, ratio) {
-  const outLen = Math.max(1, Math.round(samples.length / ratio));
-  const out = new Float32Array(outLen);
-  for (let i = 0; i < outLen; i++) {
-    const srcPos = i * ratio;
+// Pitch-shifts a note by resampling directly from the full original buffer,
+// centered on the note, reading exactly targetLen*ratio source samples (a
+// single continuous resample — no separate time-stretch stage, which is
+// what previously introduced audible pitch error from grain-boundary phase
+// interference). For ratio > 1 this naturally borrows a little audio from
+// just before/after the note, which is fine — it's still the singer's own
+// voice from the same recording.
+function resampleNoteFromCenter(channelData, centerSample, targetLen, ratio) {
+  const neededSourceLen = targetLen * ratio;
+  const srcStart = centerSample - neededSourceLen / 2;
+  const out = new Float32Array(targetLen);
+  for (let i = 0; i < targetLen; i++) {
+    const srcPos = srcStart + i * ratio;
     const i0 = Math.floor(srcPos);
     const frac = srcPos - i0;
-    const s0 = samples[i0] || 0;
-    const s1 = samples[i0 + 1] || s0;
+    const s0 = i0 >= 0 && i0 < channelData.length ? channelData[i0] : 0;
+    const s1 = i0 + 1 >= 0 && i0 + 1 < channelData.length ? channelData[i0 + 1] : s0;
     out[i] = s0 + (s1 - s0) * frac;
   }
   return out;
 }
 
-// Overlap-add granular time-stretch: restores the pitch-shifted segment to
-// `targetLen` samples without further altering its pitch content.
-function timeStretchOLA(samples, targetLen) {
-  const inLen = samples.length;
-  if (inLen === 0 || targetLen <= 0) return new Float32Array(Math.max(0, targetLen));
-  const grain = Math.min(2048, Math.max(256, Math.floor(inLen / 4) || 256));
-  const hopOut = Math.floor(grain / 2);
-  const speed = inLen / targetLen;
-  const hopIn = hopOut * speed;
-  const out = new Float32Array(targetLen);
-  const weight = new Float32Array(targetLen);
-  const win = new Float32Array(grain);
-  for (let i = 0; i < grain; i++) win[i] = 0.5 - 0.5 * Math.cos((2 * Math.PI * i) / Math.max(1, grain - 1));
-
-  let outPos = 0, inPos = 0;
-  while (outPos < targetLen) {
-    const base = Math.floor(inPos);
-    for (let i = 0; i < grain; i++) {
-      const srcIdx = base + i;
-      const dstIdx = outPos + i;
-      if (srcIdx >= 0 && srcIdx < inLen && dstIdx < targetLen) {
-        out[dstIdx] += samples[srcIdx] * win[i];
-        weight[dstIdx] += win[i];
-      }
-    }
-    outPos += hopOut;
-    inPos += hopIn;
-  }
-  for (let i = 0; i < targetLen; i++) out[i] = weight[i] > 0.0001 ? out[i] / weight[i] : 0;
-  return out;
-}
-
-// Pitch-shifts one audio segment by `ratio`, producing exactly `targetLen`
-// samples (so it lines up with the original note timing).
-function pitchShiftSegment(samples, ratio, targetLen) {
-  const shifted = resampleBuffer(samples, ratio);
-  return timeStretchOLA(shifted, targetLen);
-}
-
-// Builds a full-length harmony track by pitch-shifting the real recorded
-// audio underneath each melody note to that note's harmony pitch.
+// Builds a full-length harmony track. Starts as an exact copy of the real
+// recording (so consonants, breaths, and pauses are always there,
+// byte-identical to the original), then replaces the audio under each
+// melody note with a pitch-shifted version, crossfading at the note edges
+// so it blends cleanly with the untouched audio around it.
 function buildPitchShiftedHarmonyBuffer(ctx, recordedBuffer, melodyNotes, harmonyNotes, keyInfo) {
   const sr = recordedBuffer.sampleRate;
   const channelData = recordedBuffer.getChannelData(0);
   const totalLen = channelData.length;
   const out = new Float32Array(totalLen);
+  out.set(channelData);
+
+  const crossfadeSamples = Math.round(0.012 * sr); // ~12ms
 
   harmonyNotes.forEach((hn, i) => {
     const mn = melodyNotes[i];
     if (!mn) return;
     const startSample = Math.max(0, Math.floor(mn.start * sr));
     const endSample = Math.min(totalLen, Math.floor(mn.end * sr));
-    if (endSample <= startSample) return;
-    const segment = channelData.subarray(startSample, endSample);
+    const targetLen = endSample - startSample;
+    if (targetLen <= 0) return;
+
     const melodyFreq = midiToFreq(scaleStepToMidi(mn.step, keyInfo.tonic, keyInfo.mode));
     const harmonyFreq = midiToFreq(scaleStepToMidi(hn.hStep, keyInfo.tonic, keyInfo.mode));
     const ratio = harmonyFreq / melodyFreq;
-    const targetLen = endSample - startSample;
-    const shifted = pitchShiftSegment(segment, ratio, targetLen);
-    for (let k = 0; k < targetLen; k++) out[startSample + k] += shifted[k];
+    const centerSample = (startSample + endSample) / 2;
+    const shifted = resampleNoteFromCenter(channelData, centerSample, targetLen, ratio);
+
+    for (let k = 0; k < targetLen; k++) {
+      let w = 1;
+      if (k < crossfadeSamples) w = k / crossfadeSamples;
+      else if (k > targetLen - crossfadeSamples) w = (targetLen - k) / crossfadeSamples;
+      const idx = startSample + k;
+      out[idx] = out[idx] * (1 - w) + shifted[k] * w;
+    }
   });
 
   const buffer = ctx.createBuffer(1, totalLen, sr);
